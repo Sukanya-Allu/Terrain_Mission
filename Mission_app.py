@@ -188,35 +188,65 @@ def generate_takeoff_and_cruise(home, first_survey_point, config):
     })
     item_id_counter += 1
     return path, trigger_points
-
-def mission_end_to_rtl(last_point, last_alt, rtl_pt, loiter_distance=500):
+def mission_end_to_rtl(last_point, last_alt, rtl_pt, config):
+    """
+    Generate path from last survey point to RTL with terrain-aware altitudes.
+    Returns: list of (lat, lon, alt) points with loiter at specified distance.
+    """
     rtl_points = []
     last_xy = (last_point[0], last_point[1])
+    loiter_distance = config.get("loiter_distance", 500)
+    safety_margin = config.get("safety_margin", 150)
+    
+    # Calculate loiter point
     brg_to_rtl = calculate_bearing(last_xy, rtl_pt)
     loiter_xy = move_point_along_bearing(rtl_pt, (brg_to_rtl + 180) % 360, loiter_distance)
+    
+    # Dense sampling (every ~50m)
+    total_dist = geodesic(last_xy, loiter_xy).meters
+    num_samples = max(5, int(total_dist / 50))
+    sample_coords = []
+    for i in range(num_samples + 1):
+        dist = total_dist * (i / num_samples)
+        intermediate = move_point_along_bearing(last_xy, brg_to_rtl, dist)
+        sample_coords.append(intermediate)
+    sample_coords.append(rtl_pt)  # Include RTL point
+    
+    # Fetch peak elevation
+    elevs = fetch_elevations(sample_coords, config=config)
+    safe_alt = elevs[0] + safety_margin  # Peak + 150m
+    
+    # Generate 5 points
     lats = np.linspace(last_xy[0], loiter_xy[0], 4).tolist() + [rtl_pt[0]]
     lons = np.linspace(last_xy[1], loiter_xy[1], 4).tolist() + [rtl_pt[1]]
     for i in range(5):
         lat, lon = lats[i], lons[i]
         if i == 4:
+            # RTL: Fixed at 40m to match takeoff altitude
             alt = 40
         else:
-            alt = last_alt
+            alt = max(last_alt, safe_alt)  # Use highest of survey or RTL path altitude
         rtl_points.append((lat, lon, alt))
+    
     return rtl_points
 
 def parse_kml(kml_content):
-    tree = ET.ElementTree(ET.fromstring(kml_content))
-    root = tree.getroot()
-    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
-    for ls in root.findall('.//kml:LineString', ns):
+    try:
+        tree = ET.ElementTree(ET.fromstring(kml_content))
+        root = tree.getroot()
+        ns = {'kml': 'http://www.opengis.net/kml/2.2'}
         coords = []
-        for c in ls.find('kml:coordinates', ns).text.strip().split():
-            lon, lat, *_ = map(float, c.split(','))
-            coords.append((lat, lon))
+        for ls in root.findall('.//kml:LineString', ns):
+            for c in ls.find('kml:coordinates', ns).text.strip().split():
+                lon, lat, *_ = map(float, c.split(','))
+                coords.append((lat, lon))
         return coords
-    return []
-
+    except ET.ParseError:
+        st.error("❌ Invalid KML format.")
+        return []
+    except Exception:
+        st.error("❌ Failed to parse KML coordinates.")
+        return []
 def calculate_angle(p1, p2, p3):
     a = np.array([p1[0]-p2[0], p1[1]-p2[1]])
     b = np.array([p3[0]-p2[0], p3[1]-p2[1]])
@@ -274,7 +304,6 @@ def create_trigger_item(lat, lon, alt, trigger_type, trigger_distance, item_id):
             "type": "SimpleItem"
         }
     return None
-
 def generate_simplified_path(lines, home_pt, rtl_pt, config):
     path = []
     trigger_points = []
@@ -286,14 +315,16 @@ def generate_simplified_path(lines, home_pt, rtl_pt, config):
     item_id_counter += len(init_points)
     lines = adjust_line_directions(lines)
     prev_exit, prev_alt = None, path[-1][2]
+    total_segments = len(lines)
     for i, seg in enumerate(lines):
+        st.text(f"Processing segment {i+1}/{total_segments}...")
         total_seg_dist = sum(geodesic(seg[j], seg[j+1]).meters for j in range(len(seg)-1))
         num_seg_samples = max(5, int(total_seg_dist / 50))
         seg_coords = []
         for j in range(len(seg)-1):
             p1, p2 = seg[j], seg[j+1]
             seg_dist = geodesic(p1, p2).meters
-            samples = max(5, int(seg_dist / 50))
+            samples = max(3, int(seg_dist / 50))
             lats = np.linspace(p1[0], p2[0], samples)
             lons = np.linspace(p1[1], p2[1], samples)
             seg_coords.extend(list(zip(lats, lons)))
@@ -366,7 +397,8 @@ def generate_simplified_path(lines, home_pt, rtl_pt, config):
             })
             item_id_counter += 1
             prev_exit, prev_alt = exit_pt, cruise
-    rtl_points = mission_end_to_rtl(exit_pt, cruise, rtl_pt, loiter_distance=config["loiter_distance"])
+    st.text("Generating RTL path...")
+    rtl_points = mission_end_to_rtl(exit_pt, cruise, rtl_pt, config)  # Fixed call
     path.extend(rtl_points)
     for i, pt in enumerate(rtl_points):
         trigger_type = "loiter" if i == 3 else "none"
@@ -377,7 +409,6 @@ def generate_simplified_path(lines, home_pt, rtl_pt, config):
         })
         item_id_counter += 1
     return path, trigger_points
-
 def write_qgc_plan(points, trigger_points, start_trigger_distance, end_trigger_distance):
     items = []
     item_id = 1
@@ -468,10 +499,13 @@ def write_qgc_plan(points, trigger_points, start_trigger_distance, end_trigger_d
         "rallyPoints": {"points": [], "version": 2},
         "version": 1
     }
+    # Save to file and return JSON for download
+    output_file = "mission.plan"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(plan, f, indent=2)
     return plan
-
 # Streamlit UI
-st.title("Terrain following Plan for QGroundControl")
+st.title("Terrain Following Plan for QGroundControl")
 st.markdown("Upload a KML file and provide mission parameters to generate a QGroundControl mission plan.")
 
 # Input form
@@ -479,11 +513,11 @@ with st.form("mission_form"):
     st.subheader("Mission Parameters")
     col1, col2 = st.columns(2)
     with col1:
-        home_lat = st.number_input("Home Latitude", value=0.0, format="%.6f", step=0.000001)
-        home_lon = st.number_input("Home Longitude", value=0.0, format="%.6f", step=0.000001)
+        home_lat = st.number_input("Home Latitude (used for RTL)", value=0.0, format="%.6f", step=0.000001)
+        home_lon = st.number_input("Home Longitude (used for RTL)", value=0.0, format="%.6f", step=0.000001)
     with col2:
-        rtl_lat = st.number_input("RTL Latitude", value=0.0, format="%.6f", step=0.000001)
-        rtl_lon = st.number_input("RTL Longitude", value=0.0, format="%.6f", step=0.000001)
+        st.markdown("**RTL Point**")
+        st.info("RTL uses the same coordinates as the Home Point. Altitude set to terrain elevation + 50m for safety.")
     st.number_input("3rd WP Altitude (fixed at 150m, ignored)", value=150.0, disabled=True)
     start_trigger = st.number_input("Start Camera Trigger Distance (meters)", value=40.0, min_value=0.0, step=1.0)
     end_trigger = st.number_input("End Camera Trigger Distance (meters)", value=0.0, min_value=0.0, step=1.0)
@@ -491,9 +525,17 @@ with st.form("mission_form"):
     submit = st.form_submit_button("Generate Mission Plan")
 
 # Process form submission
-if submit and kml_file is not None:
-    try:
-        with st.spinner("Generating mission plan..."):
+if submit:
+    if kml_file is None:
+        st.error("❌ Please upload a KML file.")
+    elif not (-90 <= home_lat <= 90 and -180 <= home_lon <= 180):
+        st.error("❌ Invalid Home Latitude or Longitude.")
+    else:
+        try:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            status_text.text("Initializing mission plan...")
+            
             config = {
                 "takeoff_altitudes": [40, 60, 150],
                 "loiter_radius": 200,
@@ -506,20 +548,36 @@ if submit and kml_file is not None:
                 "output_filename": "mission.plan"
             }
             home_pt = (home_lat, home_lon)
-            rtl_pt = (rtl_lat, rtl_lon)
+            rtl_pt = (home_lat, home_lon)
+            
+            status_text.text("Parsing KML file...")
+            progress_bar.progress(20)
             kml_content = kml_file.read().decode('utf-8')
             coords = parse_kml(kml_content)
             if not coords:
                 st.error("❌ No valid LineString found in KML file.")
+                progress_bar.empty()
+                status_text.empty()
             else:
+                status_text.text("Processing survey lines...")
+                progress_bar.progress(40)
                 segments = split_lines_by_turn(coords)
                 main_lines = filter_main_lines(segments)
                 if not main_lines:
                     st.error("❌ No valid survey lines found after filtering.")
+                    progress_bar.empty()
+                    status_text.empty()
                 else:
+                    status_text.text("Generating flight path (may take 1–3 minutes)...")
+                    progress_bar.progress(60)
                     path, trigger_points = generate_simplified_path(main_lines, home_pt, rtl_pt, config)
+                    
+                    status_text.text("Writing mission plan...")
+                    progress_bar.progress(80)
                     plan = write_qgc_plan(path, trigger_points, config["trigger_distance"], config["end_trigger_distance"])
                     plan_json = json.dumps(plan, indent=2)
+                    status_text.text("Finalizing plan...")
+                    progress_bar.progress(100)
                     st.success("✅ Mission plan generated successfully!")
                     st.download_button(
                         label="Download Mission Plan",
@@ -527,7 +585,7 @@ if submit and kml_file is not None:
                         file_name="mission.plan",
                         mime="application/json"
                     )
-    except Exception as e:
-        st.error(f"❌ Error processing KML file: {str(e)}")
-elif submit and kml_file is None:
-    st.error("❌ Please upload a KML file.")
+        except Exception as e:
+            st.error(f"❌ Error processing: {str(e)}. Check KML file or internet connection.")
+            progress_bar.empty()
+            status_text.empty()
